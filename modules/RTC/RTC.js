@@ -10,29 +10,33 @@ var DataChannels = require("./DataChannels");
 var JitsiRemoteTrack = require("./JitsiRemoteTrack.js");
 var MediaType = require("../../service/RTC/MediaType");
 var VideoType = require("../../service/RTC/VideoType");
+var GlobalOnErrorHandler = require("../util/GlobalOnErrorHandler");
 
 function createLocalTracks(tracksInfo, options) {
     var newTracks = [];
     var deviceId = null;
     tracksInfo.forEach(function(trackInfo){
         if (trackInfo.mediaType === MediaType.AUDIO) {
-          deviceId = options.micDeviceId;
+            deviceId = options.micDeviceId;
         } else if (trackInfo.videoType === VideoType.CAMERA){
-          deviceId = options.cameraDeviceId;
+            deviceId = options.cameraDeviceId;
         }
         var localTrack
             = new JitsiLocalTrack(
                 trackInfo.stream,
                 trackInfo.track,
                 trackInfo.mediaType,
-                trackInfo.videoType, trackInfo.resolution, deviceId);
+                trackInfo.videoType,
+                trackInfo.resolution,
+                deviceId,
+                options.facingMode);
         newTracks.push(localTrack);
     });
     return newTracks;
 }
 
-function RTC(room, options) {
-    this.room = room;
+function RTC(conference, options) {
+    this.conference = conference;
     this.localTracks = [];
     //FIXME: We should support multiple streams per jid.
     this.remoteTracks = {};
@@ -41,37 +45,20 @@ function RTC(room, options) {
     this.eventEmitter = new EventEmitter();
     var self = this;
     this.options = options || {};
-    room.addPresenceListener("videomuted", function (values, from) {
-        if(!self.remoteTracks[from])
-            return;
-        var videoTrack = self.getRemoteVideoTrack(from);
-        // If there is no video track, but we receive it is muted,
-        // we need to create a dummy track which we will mute, so we can
-        // notify interested about the muting
-        if (!videoTrack) {
-            videoTrack = self.createRemoteTrack({
-                    owner: room.roomjid + "/" + from,
-                    videoType: VideoType.CAMERA,
-                    mediaType: MediaType.VIDEO,
-                    isFake: true
-                });
-            self.eventEmitter
-                .emit(RTCEvents.FAKE_VIDEO_TRACK_CREATED, videoTrack);
-        }
-        videoTrack.setMute(values.value == "true");
-    });
-    room.addPresenceListener("audiomuted", function (values, from) {
-        var audioTrack = self.getRemoteAudioTrack(from);
-        if (audioTrack) {
-            audioTrack.setMute(values.value == "true");
-        }
-    });
-    room.addPresenceListener("videoType", function(data, from) {
-        var videoTrack = self.getRemoteVideoTrack(from);
-        if (videoTrack) {
-            videoTrack._setVideoType(data.value);
-        }
-    });
+
+    // Switch audio output device on all remote audio tracks. Local audio tracks
+    // handle this event by themselves.
+    if (RTCUtils.isDeviceChangeAvailable('output')) {
+        RTCUtils.addListener(RTCEvents.AUDIO_OUTPUT_DEVICE_CHANGED,
+            function (deviceId) {
+                for (var key in self.remoteTracks) {
+                    if (self.remoteTracks.hasOwnProperty(key)
+                        && self.remoteTracks[key].audio) {
+                        self.remoteTracks[key].audio.setAudioOutput(deviceId);
+                    }
+                }
+            });
+    }
 }
 
 /**
@@ -100,47 +87,36 @@ RTC.prototype.onIncommingCall = function(event) {
     if(this.options.config.openSctp)
         this.dataChannels = new DataChannels(event.peerconnection,
             this.eventEmitter);
-    // Add local Tracks to the ChatRoom
-    this.localTracks.forEach(function(localTrack) {
-        var ssrcInfo = null;
-        if(localTrack.isVideoTrack() && localTrack.isMuted()) {
-            /**
-             * Handles issues when the stream is added before the peerconnection
-             * is created. The peerconnection is created when second participant
-             * enters the call. In that use case the track doesn't have
-             * information about it's ssrcs and no jingle packets are sent. That
-             * can cause inconsistent behavior later.
-             *
-             * For example:
-             * If we mute the stream and than second participant enter it's
-             * remote SDP won't include that track. On unmute we are not sending
-             * any jingle packets which will brake the unmute.
-             *
-             * In order to solve issues like the above one here we have to
-             * generate the ssrc information for the track .
-             */
-            localTrack._setSSRC(
-                this.room.generateNewStreamSSRCInfo());
-            ssrcInfo = {
-                mtype: localTrack.getType(),
-                type: "addMuted",
-                ssrc: localTrack.ssrc,
-                msid: localTrack.initialMSID
-            };
-        }
-        this.room.addStream(
-            localTrack.getOriginalStream(), function () {}, ssrcInfo, true);
-    }.bind(this));
 };
 
-RTC.prototype.selectedEndpoint = function (id) {
-    if(this.dataChannels)
-        this.dataChannels.handleSelectedEndpointEvent(id);
+/**
+ * Elects the participant with the given id to be the pinned participant in
+ * order to always receive video for this participant (even when last n is
+ * enabled).
+ * @param id {string} the user id.
+ * @throws NetworkError or InvalidStateError or Error if the operation fails.
+*/
+RTC.prototype.selectEndpoint = function (id) {
+    if(this.dataChannels) {
+        this.dataChannels.sendSelectedEndpointMessage(id);
+    } else {
+        throw new Error("Data channels support is disabled!");
+    }
 };
 
+/**
+ * Elects the participant with the given id to be the pinned participant in
+ * order to always receive video for this participant (even when last n is
+ * enabled).
+ * @param id {string} the user id
+ * @throws NetworkError or InvalidStateError or Error if the operation fails.
+ */
 RTC.prototype.pinEndpoint = function (id) {
-    if(this.dataChannels)
-        this.dataChannels.handlePinnedEndpointEvent(id);
+    if(this.dataChannels) {
+        this.dataChannels.sendPinnedEndpointMessage(id);
+    } else {
+        throw new Error("Data channels support is disabled!");
+    }
 };
 
 RTC.prototype.addListener = function (type, listener) {
@@ -177,7 +153,8 @@ RTC.prototype.addLocalTrack = function (track) {
         throw new Error('track must not be null nor undefined');
 
     this.localTracks.push(track);
-    track._setRTC(this);
+
+    track.conference = this.conference;
 
     if (track.isAudioTrack()) {
         this.localAudio = track;
@@ -195,16 +172,27 @@ RTC.prototype.getLocalVideoTrack = function () {
 };
 
 /**
+ * Gets JitsiRemoteTrack for the passed MediaType associated with given MUC
+ * nickname (resource part of the JID).
+ * @param type audio or video.
+ * @param resource the resource part of the MUC JID
+ * @returns {JitsiRemoteTrack|null}
+ */
+RTC.prototype.getRemoteTrackByType = function (type, resource) {
+    if (this.remoteTracks[resource])
+        return this.remoteTracks[resource][type];
+    else
+        return null;
+};
+
+/**
  * Gets JitsiRemoteTrack for AUDIO MediaType associated with given MUC nickname
  * (resource part of the JID).
  * @param resource the resource part of the MUC JID
  * @returns {JitsiRemoteTrack|null}
  */
 RTC.prototype.getRemoteAudioTrack = function (resource) {
-    if (this.remoteTracks[resource])
-        return this.remoteTracks[resource][MediaType.AUDIO];
-    else
-        return null;
+    return this.getRemoteTrackByType(MediaType.AUDIO, resource);
 };
 
 /**
@@ -214,10 +202,7 @@ RTC.prototype.getRemoteAudioTrack = function (resource) {
  * @returns {JitsiRemoteTrack|null}
  */
 RTC.prototype.getRemoteVideoTrack = function (resource) {
-    if (this.remoteTracks[resource])
-        return this.remoteTracks[resource][MediaType.VIDEO];
-    else
-        return null;
+    return this.getRemoteTrackByType(MediaType.VIDEO, resource);
 };
 
 /**
@@ -254,37 +239,65 @@ RTC.prototype.removeLocalTrack = function (track) {
     }
 };
 
+/**
+ * Initializes a new JitsiRemoteTrack instance with the data provided by (a)
+ * ChatRoom to XMPPEvents.REMOTE_TRACK_ADDED.
+ *
+ * @param {Object} event the data provided by (a) ChatRoom to
+ * XMPPEvents.REMOTE_TRACK_ADDED to (a)
+ */
 RTC.prototype.createRemoteTrack = function (event) {
     var ownerJid = event.owner;
     var remoteTrack = new JitsiRemoteTrack(
-        this,  ownerJid, event.stream,    event.track,
-        event.mediaType, event.videoType, event.ssrc, event.muted, event.isFake);
+        this.conference,  ownerJid, event.stream,    event.track,
+        event.mediaType, event.videoType, event.ssrc, event.muted);
     var resource = Strophe.getResourceFromJid(ownerJid);
-    if(!this.remoteTracks[resource]) {
-        this.remoteTracks[resource] = {};
-    }
+    var remoteTracks
+        = this.remoteTracks[resource] || (this.remoteTracks[resource] = {});
     var mediaType = remoteTrack.getType();
-    if (this.remoteTracks[resource][mediaType]) {
-        logger.warn(
-            "Overwriting remote track !", resource, mediaType);
+    if (remoteTracks[mediaType]) {
+        logger.warn("Overwriting remote track!", resource, mediaType);
     }
-    this.remoteTracks[resource][mediaType] = remoteTrack;
+    remoteTracks[mediaType] = remoteTrack;
     return remoteTrack;
 };
 
 /**
  * Removes all JitsiRemoteTracks associated with given MUC nickname (resource
- * part of the JID).
- * @param resource the resource part of the MUC JID
- * @returns {JitsiRemoteTrack|null}
+ * part of the JID). Returns array of removed tracks.
+ *
+ * @param {string} resource - The resource part of the MUC JID.
+ * @returns {JitsiRemoteTrack[]}
  */
 RTC.prototype.removeRemoteTracks = function (resource) {
-    var remoteTracks = this.remoteTracks[resource];
+    var removedTracks = [];
+    var removedAudioTrack = this.removeRemoteTrack(resource, MediaType.AUDIO);
+    var removedVideoTrack = this.removeRemoteTrack(resource, MediaType.VIDEO);
 
-    if(remoteTracks) {
-        remoteTracks['audio'] && remoteTracks['audio'].dispose();
-        remoteTracks['video'] && remoteTracks['video'].dispose();
-        delete this.remoteTracks[resource];
+    removedAudioTrack && removedTracks.push(removedAudioTrack);
+    removedVideoTrack && removedTracks.push(removedVideoTrack);
+
+    delete this.remoteTracks[resource];
+
+    return removedTracks;
+};
+
+/**
+ * Removes specified track type associated with given MUC nickname
+ * (resource part of the JID). Returns removed track if any.
+ *
+ * @param {string} resource - The resource part of the MUC JID.
+ * @param {string} mediaType - Type of track to remove.
+ * @returns {JitsiRemoteTrack|undefined}
+ */
+RTC.prototype.removeRemoteTrack = function (resource, mediaType) {
+    var remoteTracksForResource = this.remoteTracks[resource];
+
+    if (remoteTracksForResource && remoteTracksForResource[mediaType]) {
+        var track = remoteTracksForResource[mediaType];
+        track.dispose();
+        delete remoteTracksForResource[mediaType];
+        return track;
     }
 };
 
@@ -298,10 +311,6 @@ RTC.attachMediaStream =  function (elSelector, stream) {
 
 RTC.getStreamID = function (stream) {
     return RTCUtils.getStreamID(stream);
-};
-
-RTC.getVideoSrc = function (element) {
-    return RTCUtils.getVideoSrc(element);
 };
 
 /**
@@ -330,6 +339,23 @@ RTC.isDeviceChangeAvailable = function (deviceType) {
  */
 RTC.getAudioOutputDevice = function () {
     return RTCUtils.getAudioOutputDevice();
+};
+
+/**
+ * Returns list of available media devices if its obtained, otherwise an
+ * empty array is returned/
+ * @returns {Array} list of available media devices.
+ */
+RTC.getCurrentlyAvailableMediaDevices = function () {
+    return RTCUtils.getCurrentlyAvailableMediaDevices();
+};
+
+/**
+ * Returns event data for device to be reported to stats.
+ * @returns {MediaDeviceInfo} device.
+ */
+RTC.getEventDataForActiveDevice = function (device) {
+    return RTCUtils.getEventDataForActiveDevice(device);
 };
 
 /**
@@ -368,10 +394,6 @@ RTC.enumerateDevices = function (callback) {
     RTCUtils.enumerateDevices(callback);
 };
 
-RTC.setVideoSrc = function (element, src) {
-    RTCUtils.setVideoSrc(element, src);
-};
-
 /**
  * A method to handle stopping of the stream.
  * One point to handle the differences in various implementations.
@@ -387,6 +409,14 @@ RTC.stopMediaStream = function (mediaStream) {
  */
 RTC.isDesktopSharingEnabled = function () {
     return RTCUtils.isDesktopSharingEnabled();
+};
+
+/**
+ * Closes all currently opened data channels.
+ */
+RTC.prototype.closeAllDataChannels = function () {
+    if(this.dataChannels)
+        this.dataChannels.closeAllChannels();
 };
 
 RTC.prototype.dispose = function() {
@@ -428,22 +458,69 @@ RTC.prototype.setAudioLevel = function (resource, audioLevel) {
 RTC.prototype.getResourceBySSRC = function (ssrc) {
     if((this.localVideo && ssrc == this.localVideo.getSSRC())
         || (this.localAudio && ssrc == this.localAudio.getSSRC())) {
-        return Strophe.getResourceFromJid(this.room.myroomjid);
+        return this.conference.myUserId();
     }
 
-    var self = this;
-    var resultResource = null;
-    Object.keys(this.remoteTracks).some(function (resource) {
-        var audioTrack = self.getRemoteAudioTrack(resource);
-        var videoTrack = self.getRemoteVideoTrack(resource);
-        if((audioTrack && audioTrack.getSSRC() == ssrc) ||
-            (videoTrack && videoTrack.getSSRC() == ssrc)) {
-            resultResource = resource;
-            return true;
-        }
-    });
-
-    return resultResource;
+    var track = this.getRemoteTrackBySSRC(ssrc);
+    return track? track.getParticipantId() : null;
 };
+
+/**
+ * Searches in remoteTracks for the ssrc and returns the corresponding track.
+ * @param ssrc the ssrc to check.
+ */
+RTC.prototype.getRemoteTrackBySSRC = function (ssrc) {
+    for (var resource in this.remoteTracks) {
+        var track = this.getRemoteAudioTrack(resource);
+        if(track && track.getSSRC() == ssrc) {
+            return track;
+        }
+        track = this.getRemoteVideoTrack(resource);
+        if(track && track.getSSRC() == ssrc) {
+            return track;
+        }
+    }
+    return null;
+};
+
+/**
+ * Handles remote track mute / unmute events.
+ * @param type {string} "audio" or "video"
+ * @param isMuted {boolean} the new mute state
+ * @param from {string} user id
+ */
+RTC.prototype.handleRemoteTrackMute = function (type, isMuted, from) {
+    var track = this.getRemoteTrackByType(type, from);
+    if (track) {
+        track.setMute(isMuted);
+    }
+}
+
+/**
+ * Handles remote track video type events
+ * @param value {string} the new video type
+ * @param from {string} user id
+ */
+RTC.prototype.handleRemoteTrackVideoTypeChanged = function (value, from) {
+    var videoTrack = this.getRemoteVideoTrack(from);
+    if (videoTrack) {
+        videoTrack._setVideoType(value);
+    }
+}
+
+/**
+ * Sends message via the datachannels.
+ * @param to {string} the id of the endpoint that should receive the message.
+ * If "" the message will be sent to all participants.
+ * @param payload {object} the payload of the message.
+ * @throws NetworkError or InvalidStateError or Error if the operation fails.
+ */
+RTC.prototype.sendDataChannelMessage = function (to, payload) {
+    if(this.dataChannels) {
+        this.dataChannels.sendDataChannelMessage(to, payload);
+    } else {
+        throw new Error("Data channels support is disabled!");
+    }
+}
 
 module.exports = RTC;

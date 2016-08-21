@@ -5,7 +5,8 @@ var logger = require("jitsi-meet-logger").getLogger(__filename);
 var JingleSession = require("./JingleSessionPC");
 var XMPPEvents = require("../../service/xmpp/XMPPEvents");
 var RTCBrowserType = require("../RTC/RTCBrowserType");
-
+var GlobalOnErrorHandler = require("../util/GlobalOnErrorHandler");
+var Statistics = require("../statistics/statistics");
 
 module.exports = function(XMPP, eventEmitter) {
     Strophe.addConnectionPlugin('jingle', {
@@ -21,38 +22,6 @@ module.exports = function(XMPP, eventEmitter) {
         },
         init: function (conn) {
             this.connection = conn;
-            var disco = conn.disco;
-            if (disco) {
-                // http://xmpp.org/extensions/xep-0167.html#support
-                // http://xmpp.org/extensions/xep-0176.html#support
-                disco.addFeature('urn:xmpp:jingle:1');
-                disco.addFeature('urn:xmpp:jingle:apps:rtp:1');
-                disco.addFeature('urn:xmpp:jingle:transports:ice-udp:1');
-                disco.addFeature('urn:xmpp:jingle:apps:dtls:0');
-                disco.addFeature('urn:xmpp:jingle:transports:dtls-sctp:1');
-                disco.addFeature('urn:xmpp:jingle:apps:rtp:audio');
-                disco.addFeature('urn:xmpp:jingle:apps:rtp:video');
-
-                // Lipsync
-                if (RTCBrowserType.isChrome()) {
-                    this.connection.disco.addFeature(
-                        'http://jitsi.org/meet/lipsync');
-                }
-
-                if (RTCBrowserType.isChrome() || RTCBrowserType.isOpera()
-                    || RTCBrowserType.isTemasysPluginUsed()) {
-                    disco.addFeature('urn:ietf:rfc:4588');
-                }
-
-                // this is dealt with by SDP O/A so we don't need to announce this
-                //disco.addFeature('urn:xmpp:jingle:apps:rtp:rtcp-fb:0'); // XEP-0293
-                //disco.addFeature('urn:xmpp:jingle:apps:rtp:rtp-hdrext:0'); // XEP-0294
-
-                disco.addFeature('urn:ietf:rfc:5761'); // rtcp-mux
-                disco.addFeature('urn:ietf:rfc:5888'); // a=group, e.g. bundle
-
-                //disco.addFeature('urn:ietf:rfc:5576'); // a=ssrc
-            }
             this.connection.addHandler(this.onJingle.bind(this), 'urn:xmpp:jingle:1', 'iq', 'set', null, null);
         },
         onJingle: function (iq) {
@@ -132,6 +101,8 @@ module.exports = function(XMPP, eventEmitter) {
                             .up();
                         this.terminate(sess.sid);
                     }
+                    Statistics.analytics.sendEvent(
+                        'xmpp.session-initiate', now);
                     break;
                 case 'session-terminate':
                     logger.log('terminating...', sess.sid);
@@ -145,15 +116,21 @@ module.exports = function(XMPP, eventEmitter) {
                     this.terminate(sess.sid, reasonCondition, reasonText);
                     break;
                 case 'transport-replace':
-                    logger.info("(TIME) Start transport replace",
-                                window.performance.now());
+                    var now = window.performance.now();
+                    logger.info("(TIME) Start transport replace", now);
+                    Statistics.analytics.sendEvent(
+                        'xmpp.transport-replace.start', now);
+
                     sess.replaceTransport($(iq).find('>jingle'),
                         function () {
+                            var now = window.performance.now();
                             logger.info(
-                                "(TIME) Transport replace success!",
-                                window.performance.now());
+                                "(TIME) Transport replace success!", now);
+                            Statistics.analytics.sendEvent(
+                                'xmpp.transport-replace.success', now);
                         },
                         function(error) {
+                            GlobalOnErrorHandler.callErrorHandler(error);
                             logger.error('Transport replace failed', error);
                             sess.sendTransportReject();
                         });

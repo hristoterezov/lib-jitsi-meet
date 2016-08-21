@@ -54,7 +54,7 @@ function addMediaStreamInactiveHandler(mediaStream, handler) {
  * @param videoType the VideoType for this track if any
  * @param ssrc the SSRC of this track if known
  */
-function JitsiTrack(rtc, stream, track, streamInactiveHandler, trackMediaType,
+function JitsiTrack(conference, stream, track, streamInactiveHandler, trackMediaType,
                     videoType, ssrc)
 {
     /**
@@ -62,7 +62,7 @@ function JitsiTrack(rtc, stream, track, streamInactiveHandler, trackMediaType,
      * @type {Array}
      */
     this.containers = [];
-    this.rtc = rtc;
+    this.conference = conference;
     this.stream = stream;
     this.ssrc = ssrc;
     this.eventEmitter = new EventEmitter();
@@ -70,6 +70,14 @@ function JitsiTrack(rtc, stream, track, streamInactiveHandler, trackMediaType,
     this.type = trackMediaType;
     this.track = track;
     this.videoType = videoType;
+
+    /**
+     * Indicates whether this JitsiTrack has been disposed. If true, this
+     * JitsiTrack is to be considered unusable and operations involving it are
+     * to fail (e.g. {@link JitsiConference#addTrack(JitsiTrack)},
+     * {@link JitsiConference#removeTrack(JitsiTrack)}).
+     * @type {boolean}
+     */
     this.disposed = false;
 
     if(stream) {
@@ -77,13 +85,6 @@ function JitsiTrack(rtc, stream, track, streamInactiveHandler, trackMediaType,
             implementOnEndedHandling(this);
         }
         addMediaStreamInactiveHandler(stream, streamInactiveHandler);
-    }
-
-    this._onAudioOutputDeviceChanged = this.setAudioOutput.bind(this);
-
-    if (this.isAudioTrack()) {
-        RTCUtils.addListener(RTCEvents.AUDIO_OUTPUT_DEVICE_CHANGED,
-            this._onAudioOutputDeviceChanged);
     }
 }
 
@@ -159,8 +160,8 @@ JitsiTrack.prototype.getUsageLabel = function () {
  * @private
  */
 JitsiTrack.prototype._maybeFireTrackAttached = function (container) {
-    if (this.rtc && container) {
-        this.rtc.eventEmitter.emit(RTCEvents.TRACK_ATTACHED, this, container);
+    if (this.conference && container) {
+        this.conference._onTrackAttach(this, container);
     }
 };
 
@@ -182,55 +183,63 @@ JitsiTrack.prototype._maybeFireTrackAttached = function (container) {
  */
 JitsiTrack.prototype.attach = function (container) {
     if(this.stream) {
-        // The container must be visible in order to play or attach the stream
-        // when Temasys plugin is in use
-        var containerSel = $(container);
-        if (RTCBrowserType.isTemasysPluginUsed() &&
-            !containerSel.is(':visible')) {
-            containerSel.show();
-        }
-        container
-            = RTCUtils.attachMediaStream(container, this.stream);
+        container = RTCUtils.attachMediaStream(container, this.stream);
     }
     this.containers.push(container);
 
     this._maybeFireTrackAttached(container);
 
+    this._attachTTFMTracker(container);
+
     return container;
 };
 
 /**
- * Removes the track from the passed HTML container.
- * @param container the HTML container. If <tt>null</tt> all containers are removed.
- *        A container can be 'video', 'audio' or 'object' HTML element instance
- *        to which this JitsiTrack is currently attached to.
+ * Removes this JitsiTrack from the passed HTML container.
+ *
+ * @param container the HTML container to detach from this JitsiTrack. If
+ * <tt>null</tt> or <tt>undefined</tt>, all containers are removed. A container
+ * can be a 'video', 'audio' or 'object' HTML element instance to which this
+ * JitsiTrack is currently attached.
  */
 JitsiTrack.prototype.detach = function (container) {
-    for(var i = 0; i < this.containers.length; i++)
-    {
-        if(!container)
-        {
-            RTCUtils.setVideoSrc(this.containers[i], null);
+    for (var cs = this.containers, i = cs.length - 1; i >= 0; --i) {
+        var c = cs[i];
+        if (!container) {
+            RTCUtils.attachMediaStream(c, null);
         }
-        if(!container || $(this.containers[i]).is($(container)))
-        {
-            this.containers.splice(i,1);
+        if (!container || c === container) {
+            cs.splice(i, 1);
         }
     }
 
-    if(container) {
-        RTCUtils.setVideoSrc(container, null);
+    if (container) {
+        RTCUtils.attachMediaStream(container, null);
     }
 };
 
 /**
- * Dispose sending the media track. And removes it from the HTML.
+ * Attach time to first media tracker only if there is conference and only
+ * for the first element.
+ * @param container the HTML container which can be 'video' or 'audio' element.
+ *        It can also be 'object' element if Temasys plugin is in use and this
+ *        method has been called previously on video or audio HTML element.
+ * @private
+ */
+JitsiTrack.prototype._attachTTFMTracker = function (container) {
+};
+
+/**
+ * Removes attached event listeners.
+ *
+ * @returns {Promise}
  */
 JitsiTrack.prototype.dispose = function () {
-    RTCUtils.removeListener(RTCEvents.AUDIO_OUTPUT_DEVICE_CHANGED,
-        this._onAudioOutputDeviceChanged);
+    this.eventEmitter.removeAllListeners();
 
     this.disposed = true;
+
+    return Promise.resolve();
 };
 
 /**
@@ -345,10 +354,11 @@ JitsiTrack.prototype.setAudioOutput = function (audioOutputDeviceId) {
     return Promise.all(this.containers.map(function(element) {
         return element.setSinkId(audioOutputDeviceId)
             .catch(function (error) {
-                logger.error('Failed to change audio output device on element',
+                logger.warn(
+                    'Failed to change audio output device on element. Default' +
+                    ' or previously set audio output device will be used.',
                     element, error);
-
-                    throw error;
+                throw error;
             });
     }))
     .then(function () {

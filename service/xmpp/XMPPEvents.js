@@ -7,6 +7,11 @@ var XMPPEvents = {
     // audio.
     AUDIO_MUTED_BY_FOCUS: "xmpp.audio_muted_by_focus",
     AUTHENTICATION_REQUIRED: "xmpp.authentication_required",
+    /**
+     * Max retries value of Moderator.allocateConferenceFocus failures is
+     * reached.
+     */
+    ALLOCATE_FOCUS_MAX_RETRIES_ERROR: "xmpp.allocate_focus_max_retries_error",
     BRIDGE_DOWN: "xmpp.bridge_down",
     // Designates an event indicating that an offer (e.g. Jingle
     // session-initiate) was received.
@@ -43,6 +48,11 @@ var XMPPEvents = {
     FOCUS_DISCONNECTED: 'xmpp.focus_disconnected',
     FOCUS_LEFT: "xmpp.focus_left",
     GRACEFUL_SHUTDOWN: "xmpp.graceful_shutdown",
+    /**
+     * Event fired when 'transport-replace' Jingle message has been received,
+     * before the new offer is set on the PeerConnection.
+     */
+    ICE_RESTARTING: "rtc.ice_restarting",
     /* Event fired when XMPP error is returned to any request, it is meant to be
      * used to report 'signaling' errors to CallStats
      *
@@ -134,6 +144,17 @@ var XMPPEvents = {
      * Indicates that the local sendrecv streams in local SDP are changed.
      */
     SENDRECV_STREAMS_CHANGED: "xmpp.sendrecv_streams_changed",
+    /**
+     * Event fired when we do not get our 'session-accept' acknowledged by
+     * Jicofo. It most likely means that there is serious problem with our
+     * connection or XMPP server and we should reload the conference.
+     *
+     * We have seen that to happen in BOSH requests race condition when the BOSH
+     * request table containing the 'session-accept' was discarded by Prosody.
+     * Jicofo does send the RESULT immediately without any condition, so missing
+     * packets means that most likely it has never seen our IQ.
+     */
+    SESSION_ACCEPT_TIMEOUT: "xmpp.session_accept_timeout",
     // TODO: only used in a hack, should probably be removed.
     SET_LOCAL_DESCRIPTION_ERROR: 'xmpp.set_local_description_error',
 
@@ -152,6 +173,12 @@ var XMPPEvents = {
     START_MUTED_FROM_FOCUS: "xmpp.start_muted_from_focus",
     // Designates an event indicating that the subject of the XMPP MUC has
     // changed.
-    SUBJECT_CHANGED: "xmpp.subject_changed"
+    SUBJECT_CHANGED: "xmpp.subject_changed",
+    // Designates an event indicating that the local ICE username fragment of
+    // the jingle session has changed.
+    LOCAL_UFRAG_CHANGED: "xmpp.local_ufrag_changed",
+    // Designates an event indicating that the local ICE username fragment of
+    // the jingle session has changed.
+    REMOTE_UFRAG_CHANGED: "xmpp.remote_ufrag_changed"
 };
 module.exports = XMPPEvents;
