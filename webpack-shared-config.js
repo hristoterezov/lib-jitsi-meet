@@ -64,9 +64,7 @@ module.exports = (minimize, analyzeBundle) => {
                 })
         ].filter(Boolean),
         resolve: {
-            alias: {
-                'jquery': require.resolve('jquery/dist/jquery.slim.min.js')
-            },
+            alias: {},
             extensions: [ '', '.js', '.ts' ]
         }
     };
