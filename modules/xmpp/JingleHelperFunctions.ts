@@ -92,13 +92,11 @@ function _createSsrcGroupExtension(ssrcGroupCompactJson: ICompactSsrcGroup): Nod
  */
 function _getOrCreateRtpDescription(iq: Element, mediaType: string): Element {
     const jingle = $(iq).find('jingle')[0];
-    let content = $(jingle).find(`content[name="${mediaType}"]`);
+    let content = $(jingle).find(`content[name="${mediaType}"]`)[0];
     let description: Element;
 
-    if (content.length) {
-        content = content[0];
-    } else {
-        // I'm not suree if "creator" and "senders" are required.
+    if (!content) {
+        // I'm not sure if "creator" and "senders" are required.
         content = $build('content', {
             name: mediaType
         }).node;
